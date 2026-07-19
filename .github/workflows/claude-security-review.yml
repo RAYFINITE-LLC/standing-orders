@@ -1,0 +1,176 @@
+# L2 of the RAYFINITE pre-merge gate — see ../../SKILL.md and docs/DEVELOPMENT-WORKFLOW.md Stage 5.
+# Copy this file into the target repo's .github/workflows/ (unmodified name is fine:
+# claude-security-review.yml). Pair with claude-code-review.yml (general correctness review) —
+# this one is focused specifically on security-sensitive findings (auth, input handling,
+# secrets, money).
+#
+# Engine: anthropics/claude-code-action (same action claude-code-review.yml uses), NOT
+# anthropics/claude-code-security-review. Root cause: the standalone security-review action's
+# `main` branch does not accept a `claude-code-oauth-token` input (valid inputs are
+# claude-api-key, claude-model, comment-pr, ... — no OAuth-token support), so the credential
+# this runbook deliberately uses (see ROLLOUT.md §1 — no long-lived API keys provisioned) is
+# silently ignored, ANTHROPIC_API_KEY ends up unset, and the action fails on any PR with
+# scannable content. A docs-only diff exits that action early, which is what made this look like
+# a transient failure instead of a hard break. Rather than provision an API key we deliberately
+# avoid, the gate runs the security review through claude-code-action (which does support the
+# OAuth token) with a security-focused prompt below. Revisit if claude-code-security-review gains
+# OAuth-token support upstream.
+#
+# Auth: prefer secrets.CLAUDE_CODE_OAUTH_TOKEN (see ../../ROLLOUT.md §1 for provisioning).
+# Provisioned via `gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo RAYFINITE-LLC/<repo>` at the
+# hidden prompt — never pasted into this file, a commit, or chat.
+#
+# Authored by Pradeep Singala Reddy / RAYFINITE LLC. No AI attribution.
+
+name: claude-security-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # NOTE: intentionally `pull_request`, NOT `pull_request_target` — runs with the PR head's
+    # own permissions/secrets scope, never the base branch's elevated ones.
+
+concurrency:
+  group: claude-security-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  # No id-token permission — see the `github_token` input below for why it's deliberately
+  # omitted. No actions or packages permission either — this workflow only reads the diff and
+  # comments on the PR. Add `issues: write` ONLY if you also want it to comment on linked
+  # issues; omit otherwise (least privilege).
+
+jobs:
+  security-review:
+    # Job name kept as `security-review` (unchanged from the prior engine) so any repo that has
+    # already wired L3 required-status-checks on `claude-security-review / security-review`
+    # (per ROLLOUT.md §2) does not need to be reconfigured.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude security review
+        id: claude
+        # Pinned to a known-good exact release rather than the floating @v1 tag, so a future
+        # action release can't silently reintroduce a breaking regression here. Bump
+        # deliberately after confirming a green run. Current: v1.0.170 (2026-07-09) — same
+        # pinned version as claude-code-review.yml.
+        uses: anthropics/claude-code-action@v1.0.170
+        with:
+          # Preferred: a dedicated, distinctly-named OAuth token from `claude setup-token`
+          # (per-repo secret, never reused across repos/projects). See ROLLOUT.md §1.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Fallback (uncomment ONLY if the org has no Claude subscription token available;
+          # prefer the OAuth token above — see ROLLOUT.md §1 for the security rationale):
+          # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # REQUIRED alongside claude_code_oauth_token: without a github_token, the action
+          # falls back to exchanging a GitHub OIDC token for the official Anthropic-hosted
+          # "Claude" GitHub App's installation token — which fails with "Claude Code is not
+          # installed on this repository" unless that app (github.com/apps/claude) has been
+          # installed org-wide, a separate access-grant step nobody has taken here. Passing
+          # the workflow's own default GITHUB_TOKEN (scoped only to what `permissions:` above
+          # grants) short-circuits that exchange entirely — see action.yml's `github_token`
+          # input ("optional if using GitHub App") and src/github/token.ts. Comments post as
+          # `github-actions[bot]` instead of `claude[bot]`; everything else is unchanged.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # REQUIRED: without this allowlist the action runs Claude with NO comment-posting
+          # tools permitted — every attempt to post a finding is permission-denied and
+          # silently dropped, and the job goes green having posted nothing (the 2026-07-10
+          # mute-green incident: permission_denials_count 4, "No buffered inline comments",
+          # zero findings posted on flagrant bait). `--allowedTools` is the v1 CLI-flag
+          # syntax passed through claude_args (the action's own allowed_tools input is
+          # deprecated — see its docs/usage.md). Allowing
+          # mcp__github_inline_comment__create_inline_comment is also what makes the action
+          # install its inline-comment MCP server at all (src/mcp/install-mcp-server.ts
+          # gates the server on that tool prefix appearing in the allowlist).
+          # Bash(gh pr comment:*) lets Claude post the top-level summary via the gh CLI,
+          # authenticated by the same GITHUB_TOKEN the action exports to Claude's env.
+          # The read-only tools (Read/Grep/Glob + git/gh read commands) are allowlisted so a
+          # healthy run doesn't rack up benign permission denials while exploring the diff
+          # (the 2026-07-10 verification run posted every finding yet logged 17 denials from
+          # exploratory reads — allowlisting reads keeps denial counts meaningful and cuts
+          # wasted turns/cost).
+          claude_args: |
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
+          prompt: |
+            Review this pull request's diff for SECURITY issues only. Focus specifically on:
+            - Injection: SQL, command, XSS, and any other injection vector.
+            - Authentication/authorization gaps: missing checks, broken access control,
+              privilege boundary violations, session/token handling flaws.
+            - Secrets: hardcoded credentials, API keys, tokens, or secrets leaked into code,
+              config, comments, or log statements.
+            - Unsafe deserialization of untrusted data.
+            - SSRF: server-side requests built from untrusted input without validation.
+            - Path traversal: file paths built from untrusted input without sanitization.
+            - Untrusted-input handling generally: anywhere external/user-controlled data flows
+              into a sensitive sink without validation, escaping, or parameterization.
+            - Dependency risks: newly added or modified dependencies with known vulnerabilities
+              or that pull from untrusted sources.
+            Do NOT modify any files — comment-only. Post each finding as an inline PR review
+            comment on the relevant line using the
+            mcp__github_inline_comment__create_inline_comment tool, then post a short
+            top-level summary of what was checked and what was found using
+            `gh pr comment ${{ github.event.pull_request.number }} --body "..."`. If nothing
+            significant is found, say so briefly; do not invent findings to appear thorough.
+            Finally, end your FINAL message with exactly one verdict line, alone on its own
+            line, as the last line of the message:
+            SECURITY-VERDICT: PASS
+            if you found no security findings significant enough to block a merge, or
+            SECURITY-VERDICT: BLOCK
+            if you found one or more findings worth blocking a merge on. This exact line is
+            machine-parsed by a follow-up workflow step; never omit it and never vary its
+            format.
+          # Comment-only: this workflow never applies fixes or pushes commits.
+
+      - name: Enforce verdict (fail closed)
+        # A green check is only meaningful if we can PROVE the review ran, was able to post,
+        # and explicitly passed. This step fails the job on:
+        #   (a) an explicit SECURITY-VERDICT: BLOCK from the reviewer;
+        #   (b) NO verdict line at all — a mute, truncated, or errored review must never
+        #       pass (fail closed);
+        #   (c) any permission-denied attempt to use a comment-POSTING tool — that is the
+        #       2026-07-10 mute-green class, where both gate workflows ran real analysis but
+        #       the permission layer silently dropped every finding and the jobs stayed
+        #       green on flagrant bait.
+        # Exploratory read-tool denials alone do NOT fail the job: a verified-healthy run
+        # that posted every finding still logged 17 benign denials probing tools outside
+        # the allowlist, so "any denial > 0 fails" would permanently redline the gate.
+        # Posting-tool denials are the regression signal that matters.
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          set -u
+          if [ -z "${EXECUTION_FILE:-}" ] || [ ! -f "$EXECUTION_FILE" ]; then
+            echo "::error::No Claude execution output file — cannot prove the security review ran. Failing closed."
+            exit 1
+          fi
+          denials_total=$(jq -r '[.[] | select(.type=="result")][-1].permission_denials // [] | length' "$EXECUTION_FILE")
+          denied_posting=$(jq -r '[.[] | select(.type=="result")][-1].permission_denials // []
+            | map(select(
+                (.tool_name | startswith("mcp__github_inline_comment__"))
+                or (.tool_name == "Bash" and ((.tool_input.command // "") | startswith("gh pr comment")))
+              )) | length' "$EXECUTION_FILE")
+          echo "permission denials: total=$denials_total posting-tool=$denied_posting"
+          if [ "$denied_posting" -gt 0 ]; then
+            echo "::error::A comment-posting tool was permission-denied ($denied_posting denial(s)) — findings may have been silently dropped (mute-green regression). Failing closed."
+            exit 1
+          fi
+          verdict=$(jq -r '[.[] | select(.type=="result")][-1].result // empty' "$EXECUTION_FILE" \
+            | grep -E -o 'SECURITY-VERDICT: (PASS|BLOCK)' | tail -1 || true)
+          case "$verdict" in
+            "SECURITY-VERDICT: PASS")
+              echo "Explicit PASS verdict with no posting-tool denials — gate green." ;;
+            "SECURITY-VERDICT: BLOCK")
+              echo "::error::Security reviewer issued SECURITY-VERDICT: BLOCK — see the findings posted on this PR."
+              exit 1 ;;
+            *)
+              echo "::error::No SECURITY-VERDICT line found in the reviewer's final message — a mute or errored review must never pass. Failing closed."
+              exit 1 ;;
+          esac

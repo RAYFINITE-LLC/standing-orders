@@ -1,0 +1,99 @@
+# L2 of the RAYFINITE pre-merge gate — see ../../SKILL.md and docs/DEVELOPMENT-WORKFLOW.md Stage 5.
+# Copy this file into the target repo's .github/workflows/ (unmodified name is fine:
+# claude-code-review.yml). Runs anthropics/claude-code-action on every PR and posts a
+# comment-only correctness/security review. This workflow, once its check is added as a
+# REQUIRED STATUS CHECK (L3 — see ../../ROLLOUT.md §2), is what makes the gate unbypassable.
+#
+# Auth: prefer secrets.CLAUDE_CODE_OAUTH_TOKEN (see ../../ROLLOUT.md §1 for provisioning).
+# Provisioned via `gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo RAYFINITE-LLC/<repo>` at the
+# hidden prompt — never pasted into this file, a commit, or chat.
+#
+# Authored by Pradeep Singala Reddy / RAYFINITE LLC. No AI attribution.
+
+name: claude-code-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # NOTE: intentionally `pull_request`, NOT `pull_request_target` — this workflow must run
+    # with the PR head's own permissions/secrets scope, never the base branch's elevated ones.
+
+concurrency:
+  group: claude-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  # No id-token permission — see the `github_token` input below for why it's deliberately
+  # omitted. No actions or packages permission either — this workflow only reads the diff and
+  # comments on the PR. Add `issues: write` ONLY if you also want it to comment on linked
+  # issues; omit otherwise (least privilege).
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude code review
+        # Pinned to a known-good exact release rather than the floating @v1 tag, so a future
+        # action release can't silently reintroduce a breaking regression here. Bump
+        # deliberately after confirming a green run. Current: v1.0.170 (2026-07-09).
+        uses: anthropics/claude-code-action@v1.0.170
+        with:
+          # Preferred: a dedicated, distinctly-named OAuth token from `claude setup-token`
+          # (per-repo secret, never reused across repos/projects). See ROLLOUT.md §1.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Fallback (uncomment ONLY if the org has no Claude subscription token available;
+          # prefer the OAuth token above — see ROLLOUT.md §1 for the security rationale):
+          # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # REQUIRED alongside claude_code_oauth_token: without a github_token, the action
+          # falls back to exchanging a GitHub OIDC token for the official Anthropic-hosted
+          # "Claude" GitHub App's installation token — which fails with "Claude Code is not
+          # installed on this repository" unless that app (github.com/apps/claude) has been
+          # installed org-wide, a separate access-grant step nobody has taken here. Passing
+          # the workflow's own default GITHUB_TOKEN (scoped only to what `permissions:` above
+          # grants) short-circuits that exchange entirely — see action.yml's `github_token`
+          # input ("optional if using GitHub App") and src/github/token.ts. Comments post as
+          # `github-actions[bot]` instead of `claude[bot]`; everything else is unchanged.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # REQUIRED: without this allowlist the action runs Claude with NO comment-posting
+          # tools permitted — every attempt to post a finding is permission-denied and
+          # silently dropped, and the job goes green having posted nothing (the 2026-07-10
+          # mute-green incident: this workflow ran with 2 permission denials and "No buffered
+          # inline comments" — the "green" review had been mute all along). `--allowedTools`
+          # is the v1 CLI-flag syntax passed through claude_args (the action's own
+          # allowed_tools input is deprecated — see its docs/usage.md). Allowing
+          # mcp__github_inline_comment__create_inline_comment is also what makes the action
+          # install its inline-comment MCP server at all (src/mcp/install-mcp-server.ts
+          # gates the server on that tool prefix appearing in the allowlist).
+          # Bash(gh pr comment:*) lets Claude post the top-level summary via the gh CLI,
+          # authenticated by the same GITHUB_TOKEN the action exports to Claude's env.
+          # The read-only tools (Read/Grep/Glob + git/gh read commands) are allowlisted so a
+          # healthy run doesn't rack up benign permission denials while exploring the diff.
+          # This workflow stays ADVISORY (comment-only, non-blocking) — only
+          # claude-security-review.yml carries blocking verdict enforcement.
+          claude_args: |
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
+          prompt: |
+            Review this pull request's diff. Focus on:
+            - Correctness bugs (logic errors, off-by-one, unhandled edge cases, race conditions).
+            - Security: injection (SQL/command/XSS), auth/authz gaps, secrets in code or logs,
+              unsafe deserialization, SSRF, path traversal, and any untrusted-input handling.
+            - Escaping: any user-controlled value rendered into HTML/attributes/URLs/SQL/shell
+              without proper escaping or parameterization.
+            - Auth surfaces: session handling, token validation, permission checks, privilege
+              boundaries.
+            Do NOT modify any files — comment-only. Post each finding as an inline PR review
+            comment on the relevant line using the
+            mcp__github_inline_comment__create_inline_comment tool, then post a short
+            top-level summary using
+            `gh pr comment ${{ github.event.pull_request.number }} --body "..."`. If nothing
+            significant is found, say so briefly; do not invent findings to appear thorough.
+          # Comment-only: this workflow never applies fixes or pushes commits.
