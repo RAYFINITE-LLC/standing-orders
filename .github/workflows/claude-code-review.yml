@@ -211,6 +211,16 @@ jobs:
           echo "Not eligible would have been: agent-instruction files, .github/, .claude/, orders/,"
           echo "any non-Markdown file, or more than 500 added lines."
 
+      # Timestamped BEFORE the reviewer runs, so the enforcement step can count only the comments
+      # THIS run contributed. Counting every comment on the pull request is not the same question
+      # and gets the important case wrong: a pull request that was reviewed, pushed to again, and
+      # then silenced still carries the earlier run's comments, so "are there comments" answers
+      # yes while this run posted nothing. Any human or bot comment does the same. The guard has
+      # to ask what this run posted, and that needs a clock reading from before it started.
+      - name: Record when this review began
+        id: stamp
+        run: echo "since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Claude code review
         # `id` is REQUIRED: the enforcement step below reads steps.claude.outputs.execution_file
         # to prove the review ran and to parse its verdict. Without an id there is no handle on
@@ -352,6 +362,7 @@ jobs:
           # than inferring it from a denial count that cannot tell noise from silence.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.stamp.outputs.since }}
         run: |
           set -u
           # FAST PATH: the model was never invoked, so there is no verdict to enforce and its
@@ -387,9 +398,20 @@ jobs:
           #
           # Nothing posted plus a denial is the real regression, and still fails closed. Findings
           # posted plus a denial is a noisy run, and noise is not grounds to block a merge.
+          # Counted since SINCE, not in total. A pull request that was reviewed, pushed to again,
+          # and then silenced still carries the first run's comments, and an unfiltered count
+          # would read those as proof that THIS run posted, waving through the exact mute-green
+          # case. An empty SINCE would make the comparison match everything, so refuse instead:
+          # the guard is only meaningful if it knows when the run began.
           if [ "$denied_posting" -gt 0 ]; then
-            top=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --jq 'length' 2>/dev/null || echo 0)
-            inline=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" --jq 'length' 2>/dev/null || echo 0)
+            if [ -z "${SINCE:-}" ]; then
+              echo "::error::A posting tool was denied and this run has no start timestamp, so comments contributed by THIS run cannot be distinguished from earlier ones. Failing closed."
+              exit 1
+            fi
+            top=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.created_at >= \"$SINCE\")] | length" 2>/dev/null || echo 0)
+            inline=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.created_at >= \"$SINCE\")] | length" 2>/dev/null || echo 0)
             case "$top" in ''|*[!0-9]*) top=0 ;; esac
             case "$inline" in ''|*[!0-9]*) inline=0 ;; esac
             posted=$((top + inline))
