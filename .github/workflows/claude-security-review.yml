@@ -356,6 +356,10 @@ jobs:
         env:
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
           FAST_PATH: ${{ steps.classify.outputs.fast_path }}
+          # Needed to ask the pull request itself whether the findings actually landed, rather
+          # than inferring it from a denial count that cannot tell noise from silence.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -u
           # FAST PATH: the model was not invoked, and the check says so rather than implying a
@@ -394,9 +398,32 @@ jobs:
                 or (.tool_name == "Bash" and ((.tool_input.command // "") | startswith("gh pr comment")))
               )) | length' "$EXECUTION_FILE")
           echo "permission denials: total=$denials_total posting-tool=$denied_posting"
+          # A posting denial used to fail the job outright. Measured 2026-08-16 on agent-charters
+          # #2, standing-orders #2 and fairing #10: every one of those reviewers posted all of its
+          # findings (5, 7 and more comments), returned an explicit PASS, and was blocked anyway
+          # because two of its tool calls had been denied somewhere along the way. Three false
+          # blocks in the first hour, and a gate that blocks work it has already approved is one
+          # that gets switched off within a week.
+          #
+          # What the mute-green guard exists to catch is findings that never reached the pull
+          # request: on 2026-07-10 both gates ran real analysis, the permission layer dropped
+          # every comment, and the jobs went green having posted NOTHING. Denial count cannot
+          # distinguish that from a reviewer that fumbled one call and succeeded on the next, so
+          # stop guessing and ask the pull request what is actually on it.
+          #
+          # Nothing posted plus a denial is the real regression, and still fails closed. Findings
+          # posted plus a denial is a noisy run, and noise is not grounds to block a merge.
           if [ "$denied_posting" -gt 0 ]; then
-            echo "::error::A comment-posting tool was permission-denied ($denied_posting denial(s)) — findings may have been silently dropped (mute-green regression). Failing closed."
-            exit 1
+            top=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --jq 'length' 2>/dev/null || echo 0)
+            inline=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" --jq 'length' 2>/dev/null || echo 0)
+            case "$top" in ''|*[!0-9]*) top=0 ;; esac
+            case "$inline" in ''|*[!0-9]*) inline=0 ;; esac
+            posted=$((top + inline))
+            if [ "$posted" -eq 0 ]; then
+              echo "::error::A comment-posting tool was denied ($denied_posting denial(s)) and NOTHING is posted on this pull request - the findings were silently dropped (mute-green regression). Failing closed."
+              exit 1
+            fi
+            echo "::warning::$denied_posting posting-tool denial(s), but $posted comment(s) reached the pull request, so no finding was lost. Continuing to the verdict."
           fi
           verdict=$(jq -r '[.[] | select(.type=="result")][-1].result // empty' "$EXECUTION_FILE" \
             | grep -E -o 'SECURITY-VERDICT: (PASS|BLOCK)' | tail -1 || true)
