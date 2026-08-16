@@ -26,7 +26,12 @@ name: claude-security-review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `ready_for_review` deliberately absent. It was only needed while the job skipped drafts,
+    # to re-fire the review when a draft was promoted. Now that reviews always run, the PR was
+    # already reviewed at `opened`, so keeping it fires a SECOND full review on an IDENTICAL
+    # commit. Measured: PR #105 ran the same SHA twice, 38 hours apart - `cancel-in-progress`
+    # cannot deduplicate that, because the first run had long since completed.
+    types: [opened, synchronize, reopened]
     # NOTE: intentionally `pull_request`, NOT `pull_request_target` — runs with the PR head's
     # own permissions/secrets scope, never the base branch's elevated ones.
 
@@ -47,17 +52,215 @@ jobs:
     # Job name kept as `security-review` (unchanged from the prior engine) so any repo that has
     # already wired L3 required-status-checks on `claude-security-review / security-review`
     # (per ROLLOUT.md §2) does not need to be reconfigured.
-    if: github.event.pull_request.draft == false
+    # NO draft gate. It used to read `if: github.event.pull_request.draft == false`, which
+    # skipped this job on drafts. A job-level skip produces a COMPLETED check run with
+    # conclusion `skipped` - not a failure - so branch protection accepted it as satisfied,
+    # and a draft pull request showed a green tick having been reviewed by nothing. The
+    # nightly autopilot agent opens drafts, so on this repo the review had effectively never
+    # run on autonomously-produced work. Cost is bounded by dropping `ready_for_review`
+    # from the triggers above, and by the per-PR concurrency group cancelling runs that
+    # genuinely overlap. Concurrency alone does NOT bound it - it cannot cancel a run that
+    # already finished. A skip is not a cost lever either; it is a missing review.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout PR
         uses: actions/checkout@v4
         with:
+          # DO NOT persist the token. Without this, `actions/checkout` leaves the job's
+          # GITHUB_TOKEN in `.git/config` on the runner for the whole job. That matters here more
+          # than in an ordinary workflow, because the next step hands a model the
+          # `Bash(gh pr comment:*)` tool, and that wildcard permits `--body-file <path>`: read any
+          # local file, post its contents publicly. The model's entire job is reading untrusted
+          # pull request diffs, so a crafted diff can instruct it to do exactly that, and the
+          # credential is the obvious target.
+          #
+          # Found 2026-08-16 by this repository's own security gate on brainrung #2, the first
+          # pull request where the code review gate was able to block rather than comment. The
+          # same wildcard and the same missing flag are in every older copy of this file across
+          # the org, so this is not a regression, it is a defect that an advisory gate had no way
+          # to stop and never once reported.
+          #
+          # Neither workflow pushes or fetches after checkout (verified: no `git push`, no
+          # `git fetch` anywhere in either file), so dropping the credential costs nothing.
+          #
+          # The allowlist itself is deliberately left alone. Narrowing `Bash(gh pr comment:*)` to
+          # forbid `--body-file` risks the matcher also rejecting the legitimate `--body` call,
+          # and a reviewer that cannot post is a reviewer whose findings vanish while the job goes
+          # green: the 2026-07-10 mute-green class, which is worse than what is being fixed.
+          persist-credentials: false
           fetch-depth: 0
+
+      # ---- FAST PATH CLASSIFIER -------------------------------------------------
+      # The job ALWAYS runs. This never skips the workflow, because a workflow that does not run
+      # reports conclusion `skipped`, which is not a failure and which branch protection accepts as
+      # satisfied — the exact defect fixed on 2026-07-30. What this skips is only the expensive
+      # MODEL CALL, and only for a narrow class, and the check still reports a real result either
+      # way.
+      #
+      # Motivation: the org exhausted its 3,000 included Actions minutes in July 2026 and every
+      # merge in the org halted. A review pair costs ~10 min; a PR revised four times spends ~40.
+      # Spending five minutes of model review to conclude nothing about a changelog line is what
+      # ran the allowance out.
+      #
+      # WHAT IS DELIBERATELY *NOT* ELIGIBLE, even though it is Markdown:
+      #   AGENTS.md, CLAUDE.md, GEMINI.md, and anything under .claude/ or orders/.
+      # In an agentic organisation those files are not documentation — they are INSTRUCTIONS that
+      # every future agent reads and obeys. A malicious edit there is a prompt-injection vector
+      # with a wider blast radius than most code changes. "It is only Markdown" is exactly the
+      # reasoning that would get this wrong.
+      #   .github/ is excluded because a workflow edit can forge its own review.
+      - name: Classify diff (fast path?)
+        id: classify
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          files=$(git diff --name-only "$BASE" "$HEAD")
+          adds=$(git diff --numstat "$BASE" "$HEAD" | awk '{s+=$1} END {print s+0}')
+          # `git diff --numstat` prints `-` in the add/delete columns for BINARY files, and awk
+          # coerces that `-` to 0. A binary blob under an eligible filename therefore measured as
+          # ZERO additions: comfortably under the ceiling, invisible to the credential scan (which
+          # reads `+` lines that binaries never emit), and skipped by the model. Unmeasurable is
+          # not the same as small, and this is the floor that makes skipping the model defensible.
+          binary=$(git diff --numstat "$BASE" "$HEAD" | awk '$1 == "-" || $2 == "-" {print $3; exit}')
+          # A SYMLINK's diff is its target path — a short, plain-text line. It passes the ceiling,
+          # it is not binary, and the credential scan reads the target STRING rather than whatever
+          # it resolves to. So a link committed under an eligible name took the fast path no matter
+          # what it pointed at. Mode 120000 in `git diff --raw` is the only honest signal.
+          symlink=$(git diff --raw "$BASE" "$HEAD" | grep -E '^:[0-7]{6} 120000|^:120000 ' | head -1 | sed 's/.*	//')
+          fast=true
+          reason=""
+
+          [ -n "$files" ] || { fast=false; reason="empty diff"; }
+
+          # ALLOWLIST, not a denylist. Inverted on review: a denylist only excludes the
+          # instruction surfaces someone remembered, and the first version missed
+          # docs/CONSTITUTION.md, every agents/*.md persona and 241 skills/*/SKILL.md files — all
+          # of which agents read and obey. It was also case-sensitive, so agents.md and Claude.md
+          # slipped past the named exclusions on the case-insensitive filesystems this org runs.
+          #
+          # Only paths PROVEN inert get the fast path: append-mostly records. Everything else,
+          # including anything new, takes the full review by default. A path nobody thought about
+          # is now safe rather than eligible.
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              *-accomplishments.md)
+                # A per-project log at the repository root. A record, never an instruction.
+                case "$f" in */*) fast=false; reason="nested log, not a root record: $f"; break ;; esac
+                ;;
+              posts/*.md|daily/*.md)
+                # Generated content: read by humans, obeyed by nothing — unless someone files an
+                # instruction under it. This matched directory and extension only, so posts/AGENTS.md
+                # was fast-path eligible, and shell `case` globs `*` ACROSS `/`, so posts/x/CLAUDE.md
+                # was too. These are the files the allowlist exists to keep out; being Markdown in a
+                # content directory does not make an instruction inert.
+                #
+                # Basename-checked, and lowercased first because the filesystems this org runs on
+                # are case-insensitive — the same trap that let agents.md past the first version.
+                case "$(printf '%s' "${f##*/}" | tr '[:upper:]' '[:lower:]')" in
+                  agents.md|claude.md|gemini.md|constitution.md|skill.md)
+                    fast=false; reason="instruction file in a content directory: $f"; break ;;
+                esac
+                ;;
+              *)
+                fast=false; reason="not on the inert allowlist: $f"; break ;;
+            esac
+          done <<< "$files"
+
+          if [ "$fast" = true ] && [ -n "$binary" ]; then
+            fast=false; reason="binary file in the diff, additions unmeasurable: $binary"
+          fi
+          if [ "$fast" = true ] && [ -n "$symlink" ]; then
+            fast=false; reason="symlink in the diff, the diff shows its target not its contents: $symlink"
+          fi
+          if [ "$fast" = true ] && [ "$adds" -gt 500 ]; then
+            fast=false; reason="$adds additions exceeds fast-path ceiling 500"
+          fi
+
+          echo "fast_path=$fast" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          if [ "$fast" = true ]; then
+            echo "FAST PATH: documentation-only diff ($adds additions). Deterministic checks only."
+          else
+            echo "FULL REVIEW: $reason"
+          fi
+
+      # Cheap deterministic checks. These are NOT a substitute for the model review — they are the
+      # floor that makes skipping it defensible for this narrow class, and they run in seconds.
+      - name: Record which path ran
+        if: steps.classify.outputs.fast_path != 'true'
+        env:
+          # PASSED AS DATA, NOT SPLICED AS CODE. `reason` embeds a filename taken verbatim from
+          # `git diff --name-only`, so anyone who can open a pull request controls its contents.
+          # Interpolated into `run:` with ${{ }} it is substituted before the shell parses the
+          # script, so a crafted filename executes inside a job holding `pull-requests: write` and
+          # the review credential - and could forge the very summary this gate reports. Through
+          # `env:` the shell only ever expands it as a value. `printf %s` rather than `echo` so no
+          # escape or option in the value is interpreted either.
+          REASON: ${{ steps.classify.outputs.reason }}
+        run: |
+          {
+            echo "## 🔍 FULL REVIEW — model invoked"
+            echo ""
+            printf 'Not eligible for the fast path: `%s`\n' "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deterministic checks (fast path only)
+        id: deterministic
+        if: steps.classify.outputs.fast_path == 'true'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          added=$(git diff "$BASE" "$HEAD" | grep '^+' | grep -v '^+++' || true)
+          fail=0
+          # Credential shapes. Deliberately broad: a false positive costs one full review, a false
+          # negative costs a leaked secret.
+          if printf '%s' "$added" | grep -qE '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
+            echo "::error::possible credential in the added lines"; fail=1
+          fi
+          if printf '%s' "$added" | grep -qiE '(api[_-]?key|secret|password|token)[[:space:]]*[:=][[:space:]]*["'"'"'][^"'"'"']{12,}'; then
+            echo "::error::possible assigned secret literal in the added lines"; fail=1
+          fi
+          # INSTRUCTION-SHAPED CONTENT. `*-accomplishments.md` is not inert. This repo's own
+          # docs/ACCOMPLISHMENTS-LOG.md line 21 says "The accomplishments file IS the session
+          # handoff", auto-synced so a new session anywhere picks up the latest one to decide how
+          # to continue. That is precisely the read-and-obeyed-by-a-future-agent property used to
+          # exclude AGENTS.md and CLAUDE.md from the allowlist, so the class the fast path exists
+          # to serve is an instruction surface too.
+          #
+          # Rather than drop it — which would leave the fast path covering almost nothing — the
+          # floor scans for content shaped like a directive aimed at whoever reads this next.
+          #
+          # Narrow on INJECTION shapes, not generic imperatives. These logs are written by agents
+          # describing rules, so matching every "must" or "never" would fire on nearly every entry
+          # and the fast path would be dead on arrival. A false positive still costs only one full
+          # review; the point is to keep the floor meaningful without making it useless.
+          if printf '%s' "$added" | grep -qiE '(ignore|disregard|forget)[[:space:]]+([a-z]+[[:space:]]+)?(previous|prior|earlier|above)|</?(system|assistant|instructions?)>|^\+[[:space:]]*(system|assistant)[[:space:]]*:|from[[:space:]]+now[[:space:]]+on|you[[:space:]]+are[[:space:]]+(now[[:space:]]+)?(a|an|the)[[:space:]]|new[[:space:]]+(system[[:space:]]+)?(instructions?|rules?|directives?)|override[[:space:]]+(the[[:space:]]+)?(previous|above|rules?|polic)|(next|future)[[:space:]]+(agent|session)s?[^.]{0,40}(must|should|shall|will)|^\+#{1,6}[[:space:]]*(instructions?|rules?|directives?|standing[[:space:]]+orders?)([[:space:]]|$)'; then
+            echo "::error::added lines are instruction-shaped, and this class is read by the next agent session as its handoff"; fail=1
+          fi
+          [ "$fail" -eq 0 ] && echo "deterministic checks clean" || exit 1
+
+      # Timestamped BEFORE the reviewer runs, so the enforcement step can count only the comments
+      # THIS run contributed. Counting every comment on the pull request is not the same question
+      # and gets the important case wrong: a pull request that was reviewed, pushed to again, and
+      # then silenced still carries the earlier run's comments, so "are there comments" answers
+      # yes while this run posted nothing. Any human or bot comment does the same. The guard has
+      # to ask what this run posted, and that needs a clock reading from before it started.
+      - name: Record when this review began
+        id: stamp
+        if: steps.classify.outputs.fast_path != 'true'
+        run: echo "since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Claude security review
         id: claude
+        # Skipped ONLY for the fast-path class above. The job itself still runs and still reports a
+        # real conclusion, so this never produces a `skipped` check.
+        if: steps.classify.outputs.fast_path != 'true'
         # Pinned to a known-good exact release rather than the floating @v1 tag, so a future
         # action release can't silently reintroduce a breaking regression here. Bump
         # deliberately after confirming a green run. Current: v1.0.170 (2026-07-09) — same
@@ -97,9 +300,27 @@ jobs:
           # (the 2026-07-10 verification run posted every finding yet logged 17 denials from
           # exploratory reads — allowlisting reads keeps denial counts meaningful and cuts
           # wasted turns/cost).
+          # `--max-turns` is set EXPLICITLY rather than left to the action's default. Turn
+          # starvation is a real, observed failure mode (2026-07-19, lovelyrobo PR #33: a
+          # 14-file server-side billing PR ended `subtype: success`, `is_error: false`,
+          # num_turns 15, permission_denials_count 11, "No buffered inline comments", and NO
+          # verdict line at all; the reviewer spent most of its budget on denied calls and never
+          # reached a final message). Failing closed on that is correct, but a starved review is
+          # indistinguishable from a broken one and blocks legitimate work. This matters more
+          # here as of 2026-08-15 than it did while this gate was advisory: a starved review used
+          # to cost silent coverage, and now costs a blocked pull request. A budget large enough
+          # to explore a multi-file diff AND absorb some denials is what makes the verdict mean
+          # something rather than be a coin flip on diff size. Raise it for repos with routinely
+          # large pull requests.
           claude_args: |
+            --max-turns 40
             --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
           prompt: |
+            You have EXACTLY these tools: Read, Grep, Glob, `git diff`, `git log`, `git show`,
+            `gh pr view`, `gh pr diff`, `gh pr comment`, and the inline-comment MCP tool. Any
+            other command is permission-denied and wastes your turn budget: do not attempt
+            package managers, `cat`, `ls`, `find`, `gh api`, or network calls.
+
             Review this pull request's diff for SECURITY issues only. Focus specifically on:
             - Injection: SQL, command, XSS, and any other injection vector.
             - Authentication/authorization gaps: missing checks, broken access control,
@@ -145,8 +366,39 @@ jobs:
         # Posting-tool denials are the regression signal that matters.
         env:
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          FAST_PATH: ${{ steps.classify.outputs.fast_path }}
+          # Needed to ask the pull request itself whether the findings actually landed, rather
+          # than inferring it from a denial count that cannot tell noise from silence.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.stamp.outputs.since }}
         run: |
           set -u
+          # FAST PATH: the model was not invoked, and the check says so rather than implying a
+          # review happened. Anyone reading this log can tell which path ran — a fast-path pass
+          # must never be mistaken for a full security review.
+          if [ "${FAST_PATH:-}" = "true" ]; then
+          {
+            echo "## ⚡ FAST PATH — model review NOT invoked"
+            echo ""
+            echo "This check is **green because the diff is on the inert allowlist**, not because a"
+            echo "model reviewed it. Do not read this as a reviewed pass."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Path taken | fast (deterministic checks only) |"
+            echo "| Model review | **not invoked** |"
+            echo "| Eligible because | every changed file is a proven-inert record |"
+            echo ""
+            echo "Anything not on the allowlist — source, CI, agent instructions, governance canon,"
+            echo "skills, personas — takes the full review. See \`docs/CI-BUDGET-DISCIPLINE.md\` rule 5."
+          } >> "$GITHUB_STEP_SUMMARY"
+            echo "SECURITY-VERDICT: PASS (fast path — deterministic checks only, model NOT invoked)"
+            echo "Eligible because the diff is documentation-only Markdown, excluding agent-instruction"
+            echo "files (AGENTS.md/CLAUDE.md/GEMINI.md, .claude/, orders/) and CI definitions (.github/)."
+            echo "Credential scan on the added lines passed."
+            exit 0
+          fi
           if [ -z "${EXECUTION_FILE:-}" ] || [ ! -f "$EXECUTION_FILE" ]; then
             echo "::error::No Claude execution output file — cannot prove the security review ran. Failing closed."
             exit 1
@@ -158,9 +410,43 @@ jobs:
                 or (.tool_name == "Bash" and ((.tool_input.command // "") | startswith("gh pr comment")))
               )) | length' "$EXECUTION_FILE")
           echo "permission denials: total=$denials_total posting-tool=$denied_posting"
+          # A posting denial used to fail the job outright. Measured 2026-08-16 on agent-charters
+          # #2, standing-orders #2 and fairing #10: every one of those reviewers posted all of its
+          # findings (5, 7 and more comments), returned an explicit PASS, and was blocked anyway
+          # because two of its tool calls had been denied somewhere along the way. Three false
+          # blocks in the first hour, and a gate that blocks work it has already approved is one
+          # that gets switched off within a week.
+          #
+          # What the mute-green guard exists to catch is findings that never reached the pull
+          # request: on 2026-07-10 both gates ran real analysis, the permission layer dropped
+          # every comment, and the jobs went green having posted NOTHING. Denial count cannot
+          # distinguish that from a reviewer that fumbled one call and succeeded on the next, so
+          # stop guessing and ask the pull request what is actually on it.
+          #
+          # Nothing posted plus a denial is the real regression, and still fails closed. Findings
+          # posted plus a denial is a noisy run, and noise is not grounds to block a merge.
+          # Counted since SINCE, not in total. A pull request that was reviewed, pushed to again,
+          # and then silenced still carries the first run's comments, and an unfiltered count
+          # would read those as proof that THIS run posted, waving through the exact mute-green
+          # case. An empty SINCE would make the comparison match everything, so refuse instead:
+          # the guard is only meaningful if it knows when the run began.
           if [ "$denied_posting" -gt 0 ]; then
-            echo "::error::A comment-posting tool was permission-denied ($denied_posting denial(s)) — findings may have been silently dropped (mute-green regression). Failing closed."
-            exit 1
+            if [ -z "${SINCE:-}" ]; then
+              echo "::error::A posting tool was denied and this run has no start timestamp, so comments contributed by THIS run cannot be distinguished from earlier ones. Failing closed."
+              exit 1
+            fi
+            top=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.created_at >= \"$SINCE\")] | length" 2>/dev/null || echo 0)
+            inline=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.created_at >= \"$SINCE\")] | length" 2>/dev/null || echo 0)
+            case "$top" in ''|*[!0-9]*) top=0 ;; esac
+            case "$inline" in ''|*[!0-9]*) inline=0 ;; esac
+            posted=$((top + inline))
+            if [ "$posted" -eq 0 ]; then
+              echo "::error::A comment-posting tool was denied ($denied_posting denial(s)) and NOTHING is posted on this pull request - the findings were silently dropped (mute-green regression). Failing closed."
+              exit 1
+            fi
+            echo "::warning::$denied_posting posting-tool denial(s), but $posted comment(s) reached the pull request, so no finding was lost. Continuing to the verdict."
           fi
           verdict=$(jq -r '[.[] | select(.type=="result")][-1].result // empty' "$EXECUTION_FILE" \
             | grep -E -o 'SECURITY-VERDICT: (PASS|BLOCK)' | tail -1 || true)
