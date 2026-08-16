@@ -67,6 +67,28 @@ jobs:
       - name: Checkout PR
         uses: actions/checkout@v4
         with:
+          # DO NOT persist the token. Without this, `actions/checkout` leaves the job's
+          # GITHUB_TOKEN in `.git/config` on the runner for the whole job. That matters here more
+          # than in an ordinary workflow, because the next step hands a model the
+          # `Bash(gh pr comment:*)` tool, and that wildcard permits `--body-file <path>`: read any
+          # local file, post its contents publicly. The model's entire job is reading untrusted
+          # pull request diffs, so a crafted diff can instruct it to do exactly that, and the
+          # credential is the obvious target.
+          #
+          # Found 2026-08-16 by this repository's own security gate on brainrung #2, the first
+          # pull request where the code review gate was able to block rather than comment. The
+          # same wildcard and the same missing flag are in every older copy of this file across
+          # the org, so this is not a regression, it is a defect that an advisory gate had no way
+          # to stop and never once reported.
+          #
+          # Neither workflow pushes or fetches after checkout (verified: no `git push`, no
+          # `git fetch` anywhere in either file), so dropping the credential costs nothing.
+          #
+          # The allowlist itself is deliberately left alone. Narrowing `Bash(gh pr comment:*)` to
+          # forbid `--body-file` risks the matcher also rejecting the legitimate `--body` call,
+          # and a reviewer that cannot post is a reviewer whose findings vanish while the job goes
+          # green: the 2026-07-10 mute-green class, which is worse than what is being fixed.
+          persist-credentials: false
           fetch-depth: 0
 
       # ---- FAST PATH CLASSIFIER -------------------------------------------------
